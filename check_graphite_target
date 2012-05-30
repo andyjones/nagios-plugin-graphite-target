@@ -1,0 +1,169 @@
+#!/usr/bin/perl
+
+# Checks that particular graphite targets are within a given range
+
+use strict;
+
+use Nagios::Plugin; # imports OK, WARNING, CRITICAL and UNKNOWN
+use List::Util qw(first);
+use URI;
+use LWP::UserAgent;
+
+my $np = Nagios::Plugin->new(
+    usage => 'Usage: %s -u <graphite_url> -t <graphite_target>',
+);
+
+$np->add_arg(
+     spec    => 'host|h=s',
+     label   => 'GRAPHITE_HOST',
+     help    => 'Host running graphite eg. https://graphite.xxxxx.com',
+     required => 0,
+);
+
+$np->add_arg(
+    spec     => 'url|u=s',
+    label    => 'GRAPHITE_URL',
+    help     => "Full url to graphite eg. https://graphite.xxxxx.com/render (takes priority over --host)",
+    required => 0,
+);
+
+$np->add_arg(
+    spec     => 'mode|m=s',
+    label    => 'MODE',
+    help     => "comparison mode. Either raw (default), delta or percent",
+    default  => 'raw',
+    required => 0,
+);
+
+$np->add_arg(
+    spec     => 'target|t=s',
+    label    => 'TARGETS',
+    help     => "the graphite target (comma separate multiple targets)",
+    required => 1,
+);
+
+$np->add_arg(
+    spec     => 'from|f=s',
+    label    => 'FROM',
+    help     => 'range to check eg. -1d',
+    default  => '-1h',
+);
+
+$np->add_arg(
+    spec     => 'perfdata|p=s',
+    label    => 'BOOLEAN',
+    help     => 'output perfdata (default: 0)',
+    default  => 0,
+);
+
+$np->add_arg(
+    spec     => 'warning|w=s',
+    label    => 'THRESHOLD',
+    help     => "warn if the metric is outside this range",
+    required => 0,
+);
+
+$np->add_arg(
+    spec     => 'critical|c=s',
+    label    => 'THRESHOLD',
+    help     => "blow up if the metric is outside this range",
+    required => 0,
+);
+
+$np->getopts();
+
+my $graphite_host = $np->opts->host() || 'http://localhost';
+my $graphite_url = $np->opts->url() || "$graphite_host/render";
+my $graphite_uri = URI->new($graphite_url)
+    or $np->nagios_die( "Graphite url '$graphite_url' is not valid" );
+
+my @targets = split /\s*,\s*/, $np->opts->target;
+my $from   = $np->opts->from;
+my $mode   = lc($np->opts->mode);
+my $perfdata = lc($np->opts->perfdata);
+if ( $perfdata && $perfdata eq 'no' || $perfdata eq 'none' || $perfdata eq 'false' ) {
+    $perfdata = 0;
+}
+
+$graphite_uri->query_form(
+    target  => \@targets,
+    from    => $from,
+    rawData => 'true',
+);
+
+my $resp = LWP::UserAgent->new()->get($graphite_uri);
+if ( !$resp->is_success ) {
+    $np->nagios_die( "Unable to fetch '$graphite_uri': " . $resp->status_line );
+}
+
+my %metrics;
+foreach my $line ( split /[\r\n]+/, $resp->decoded_content() ) {
+    my ($header, $data) = split /\s*\|\s*/, $line, 2;
+    my ($target,$start_time,$end_time,$step) = split /,/, $header;
+    my (@values) = split /,/, $data;
+
+    if ( $mode eq 'percent' ) {
+	# calculates the absolute percentage change over the time period
+        # good when value may grow over time but is always large
+        # eg. number of CVs stored
+        my $first_value = first { $_ ne 'None' } @values;
+        my $last_value  = $values[-1] eq 'None' ? $values[-2] : $values[-1];
+
+        # here we have a dilemma
+        # what if first value is 0
+        # and last value is really big. then it should probably be treated as an aberation
+        my $change = $first_value && $last_value ? abs($last_value - $first_value) / $first_value : 0;
+        $metrics{$target} = sprintf("%.2f", $change*100);
+    }
+    elsif ( $mode eq 'delta' ) {
+        # similar to 'percent' but looks at the absolute change over the time period
+        # good when the baseline is near 0 but it may grow over time
+        # eg. mysql slow queries
+        my $first_value = first { $_ ne 'None' } @values;
+        my $last_value  = $values[-1] eq 'None' ? $values[-2] : $values[-1];
+
+        $metrics{$target} = abs($last_value - $first_value) || 0;
+    }
+    else {
+        # uses the actual value from graphite
+        # useful when the value is stable and should remain within a known threshold
+        # eg. load or % free memory
+        my $last_value = pop @values;
+        if ( $last_value eq 'None' ) {
+            $last_value = pop @values;
+        }
+        $metrics{$target} = $last_value;
+    }
+}
+
+my $warning_threshold = $np->opts->warning   || '0:';
+my $critical_threshold = $np->opts->critical || '0:';
+
+if ( $warning_threshold || $critical_threshold ) {
+    foreach my $target ( @targets ) {
+        if ( $perfdata ) {
+            $np->add_perfdata(
+                label => "$target.$mode",
+                value => $metrics{$target},
+                uom   => "", # we don't know the units
+                warning   => $warning_threshold,
+                critical  => $critical_threshold,
+            );
+        }
+
+        my $code = $np->check_threshold(
+            check    => $metrics{$target},
+            warning  => $warning_threshold,
+            critical => $critical_threshold,
+        );
+
+        if ( $code == OK ) {
+           $np->add_message( $code, "'$target' is '$metrics{$target}'" );
+        }
+        else {
+           $np->add_message( $code, "'$target' of '$metrics{$target}' is outside the threshold" );
+        }
+    }
+}
+
+$np->nagios_exit( $np->check_messages );
